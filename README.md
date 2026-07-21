@@ -57,6 +57,6 @@ While a chord is held, the script:
 - Rewrites mouse-move events into the matching drag events so apps track the drag
 - Posts mouse-up when the keys are released
 
-Control+Option+Shift does not activate either chord (chords are mutually exclusive).
+Chords only fire when held **alone** (no other keys, and no Command/fn). Other shortcuts win — e.g. Control+Shift+Tab or Option+Shift+Arrow release/skip the virtual click so the real shortcut can run.
 
 This requires a CGEvent tap, which is why Accessibility permission is needed.

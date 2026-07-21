@@ -1,9 +1,12 @@
 #!/usr/bin/env python3
 """
-Hold modifier chords to make macOS think a mouse button is pressed.
+Hold modifier chords alone to make macOS think a mouse button is pressed.
 
   Control+Shift  → virtual left-button down (drag with left)
   Option+Shift   → virtual right-button down (drag with right)
+
+Only the bare chord counts. Any other key (or Command/fn) means that shortcut
+wins and the virtual click is released / not started.
 
 Use this when a physical button is unreliable for dragging:
   1. Move the cursor into place
@@ -64,15 +67,33 @@ import Quartz  # noqa: E402
 OUR_TAG = 0x4D4F5553  # 'MOUS'
 USER_DATA_FIELD = Quartz.kCGEventSourceUserData
 
-# Require the chord keys and exclude the other side's exclusive modifier so
-# Control+Option+Shift does not activate both.
+# Exact match on these flags — any extra modifier (Cmd, fn, the other Alt/Ctrl)
+# means some other shortcut owns the chord. Caps Lock is ignored on purpose.
 _MODS = (
     Quartz.kCGEventFlagMaskControl
     | Quartz.kCGEventFlagMaskAlternate
     | Quartz.kCGEventFlagMaskShift
+    | Quartz.kCGEventFlagMaskCommand
+    | Quartz.kCGEventFlagMaskSecondaryFn
 )
 LEFT_CHORD = Quartz.kCGEventFlagMaskControl | Quartz.kCGEventFlagMaskShift
 RIGHT_CHORD = Quartz.kCGEventFlagMaskAlternate | Quartz.kCGEventFlagMaskShift
+
+# Hardware keycodes for modifier keys (FlagsChanged); ignore these in key tracking.
+_MODIFIER_KEYCODES = frozenset(
+    {
+        54,  # right Command
+        55,  # left Command
+        56,  # left Shift
+        57,  # Caps Lock
+        58,  # left Option
+        59,  # left Control
+        60,  # right Shift
+        61,  # right Option
+        62,  # right Control
+        63,  # fn
+    }
+)
 
 LEFT = "left"
 RIGHT = "right"
@@ -94,11 +115,13 @@ _BUTTON = {
 
 
 class ModifierClickHold:
-    """Virtual left/right click while Control+Shift / Option+Shift are held."""
+    """Virtual left/right click while Control+Shift / Option+Shift are held alone."""
 
     def __init__(self) -> None:
         self._held: str | None = None
         self._tap = None
+        # Non-modifier keys currently down — any of these means yield to other shortcuts.
+        self._extra_keys: set[int] = set()
 
     def _cursor(self):
         # CGEventSourceCreate + CGEventGetLocation needs an event; use current position.
@@ -128,12 +151,26 @@ class ModifierClickHold:
             print(f"{which} click DOWN (drag now)", flush=True)
 
     def _desired_hold(self, flags: int) -> str | None:
+        # Another key is down (e.g. Ctrl+Shift+Tab) — let that shortcut win.
+        if self._extra_keys:
+            return None
         masked = flags & _MODS
         if masked == LEFT_CHORD:
             return LEFT
         if masked == RIGHT_CHORD:
             return RIGHT
         return None
+
+    def _track_key(self, event_type, event) -> None:
+        keycode = Quartz.CGEventGetIntegerValueField(
+            event, Quartz.kCGKeyboardEventKeycode
+        )
+        if keycode in _MODIFIER_KEYCODES:
+            return
+        if event_type == Quartz.kCGEventKeyDown:
+            self._extra_keys.add(keycode)
+        elif event_type == Quartz.kCGEventKeyUp:
+            self._extra_keys.discard(keycode)
 
     def _on_event(self, proxy, event_type, event, refcon):
         if event_type in (
@@ -168,6 +205,8 @@ class ModifierClickHold:
             Quartz.kCGEventKeyDown,
             Quartz.kCGEventKeyUp,
         ):
+            if event_type in (Quartz.kCGEventKeyDown, Quartz.kCGEventKeyUp):
+                self._track_key(event_type, event)
             flags = Quartz.CGEventGetFlags(event)
             self._set_held(self._desired_hold(flags))
 
@@ -209,7 +248,8 @@ class ModifierClickHold:
         )
 
         print(
-            "Ready. Control+Shift = left hold, Option+Shift = right hold. "
+            "Ready. Control+Shift = left hold, Option+Shift = right hold "
+            "(alone — other shortcuts take priority). "
             "Release keys = release click. Ctrl+C to quit.",
             flush=True,
         )
