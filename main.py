@@ -1,12 +1,15 @@
 #!/usr/bin/env python3
 """
-Hold Control+Shift to make macOS think left-click is pressed.
+Hold modifier chords to make macOS think a mouse button is pressed.
 
-Use this when the physical left button is unreliable for dragging:
+  Control+Shift  → virtual left-button down (drag with left)
+  Option+Shift   → virtual right-button down (drag with right)
+
+Use this when a physical button is unreliable for dragging:
   1. Move the cursor into place
-  2. Hold Control+Shift  → virtual left-button down
-  3. Move the mouse      → drag
-  4. Release the keys    → virtual left-button up
+  2. Hold the chord     → virtual button down
+  3. Move the mouse     → drag
+  4. Release the keys   → virtual button up
 
 Injected clicks have modifiers stripped, so Control+Shift does NOT become
 a Control-click (right-click) on macOS.
@@ -60,14 +63,41 @@ import Quartz  # noqa: E402
 
 OUR_TAG = 0x4D4F5553  # 'MOUS'
 USER_DATA_FIELD = Quartz.kCGEventSourceUserData
-CHORD = Quartz.kCGEventFlagMaskControl | Quartz.kCGEventFlagMaskShift
+
+# Require the chord keys and exclude the other side's exclusive modifier so
+# Control+Option+Shift does not activate both.
+_MODS = (
+    Quartz.kCGEventFlagMaskControl
+    | Quartz.kCGEventFlagMaskAlternate
+    | Quartz.kCGEventFlagMaskShift
+)
+LEFT_CHORD = Quartz.kCGEventFlagMaskControl | Quartz.kCGEventFlagMaskShift
+RIGHT_CHORD = Quartz.kCGEventFlagMaskAlternate | Quartz.kCGEventFlagMaskShift
+
+LEFT = "left"
+RIGHT = "right"
+
+_BUTTON = {
+    LEFT: (
+        Quartz.kCGMouseButtonLeft,
+        Quartz.kCGEventLeftMouseDown,
+        Quartz.kCGEventLeftMouseUp,
+        Quartz.kCGEventLeftMouseDragged,
+    ),
+    RIGHT: (
+        Quartz.kCGMouseButtonRight,
+        Quartz.kCGEventRightMouseDown,
+        Quartz.kCGEventRightMouseUp,
+        Quartz.kCGEventRightMouseDragged,
+    ),
+}
 
 
 class ModifierClickHold:
-    """Virtual left-click while Control+Shift are held."""
+    """Virtual left/right click while Control+Shift / Option+Shift are held."""
 
     def __init__(self) -> None:
-        self._held = False
+        self._held: str | None = None
         self._tap = None
 
     def _cursor(self):
@@ -76,28 +106,34 @@ class ModifierClickHold:
         loc = Quartz.CGEventGetLocation(event)
         return loc
 
-    def _post_button(self, down: bool) -> None:
+    def _post_button(self, which: str, down: bool) -> None:
+        button, down_type, up_type, _drag_type = _BUTTON[which]
         source = Quartz.CGEventSourceCreate(Quartz.kCGEventSourceStateHIDSystemState)
-        etype = (
-            Quartz.kCGEventLeftMouseDown if down else Quartz.kCGEventLeftMouseUp
-        )
-        event = Quartz.CGEventCreateMouseEvent(
-            source, etype, self._cursor(), Quartz.kCGMouseButtonLeft
-        )
-        # Critical: no Control/Shift flags, or macOS treats it as Control-click.
+        etype = down_type if down else up_type
+        event = Quartz.CGEventCreateMouseEvent(source, etype, self._cursor(), button)
+        # Critical: no modifier flags, or macOS may remap clicks (e.g. Control-click).
         Quartz.CGEventSetFlags(event, 0)
         Quartz.CGEventSetIntegerValueField(event, USER_DATA_FIELD, OUR_TAG)
         Quartz.CGEventPost(Quartz.kCGHIDEventTap, event)
 
-    def _set_held(self, held: bool) -> None:
-        if held == self._held:
+    def _set_held(self, which: str | None) -> None:
+        if which == self._held:
             return
-        self._held = held
-        self._post_button(held)
-        print("click DOWN (drag now)" if held else "click UP", flush=True)
+        if self._held is not None:
+            self._post_button(self._held, False)
+            print(f"{self._held} click UP", flush=True)
+        self._held = which
+        if which is not None:
+            self._post_button(which, True)
+            print(f"{which} click DOWN (drag now)", flush=True)
 
-    def _chord_active(self, flags: int) -> bool:
-        return (flags & CHORD) == CHORD
+    def _desired_hold(self, flags: int) -> str | None:
+        masked = flags & _MODS
+        if masked == LEFT_CHORD:
+            return LEFT
+        if masked == RIGHT_CHORD:
+            return RIGHT
+        return None
 
     def _on_event(self, proxy, event_type, event, refcon):
         if event_type in (
@@ -113,13 +149,17 @@ class ModifierClickHold:
             Quartz.kCGEventLeftMouseDown,
             Quartz.kCGEventLeftMouseUp,
             Quartz.kCGEventLeftMouseDragged,
+            Quartz.kCGEventRightMouseDown,
+            Quartz.kCGEventRightMouseUp,
+            Quartz.kCGEventRightMouseDragged,
         ):
             if Quartz.CGEventGetIntegerValueField(event, USER_DATA_FIELD) == OUR_TAG:
                 return event
 
-        # While virtually held, turn plain moves into left-drags so apps track it.
-        if self._held and event_type == Quartz.kCGEventMouseMoved:
-            Quartz.CGEventSetType(event, Quartz.kCGEventLeftMouseDragged)
+        # While virtually held, turn plain moves into button-drags so apps track it.
+        if self._held is not None and event_type == Quartz.kCGEventMouseMoved:
+            _button, _down, _up, drag_type = _BUTTON[self._held]
+            Quartz.CGEventSetType(event, drag_type)
             Quartz.CGEventSetFlags(event, 0)
             return event
 
@@ -129,7 +169,7 @@ class ModifierClickHold:
             Quartz.kCGEventKeyUp,
         ):
             flags = Quartz.CGEventGetFlags(event)
-            self._set_held(self._chord_active(flags))
+            self._set_held(self._desired_hold(flags))
 
         return event
 
@@ -142,6 +182,9 @@ class ModifierClickHold:
             | Quartz.CGEventMaskBit(Quartz.kCGEventLeftMouseDown)
             | Quartz.CGEventMaskBit(Quartz.kCGEventLeftMouseUp)
             | Quartz.CGEventMaskBit(Quartz.kCGEventLeftMouseDragged)
+            | Quartz.CGEventMaskBit(Quartz.kCGEventRightMouseDown)
+            | Quartz.CGEventMaskBit(Quartz.kCGEventRightMouseUp)
+            | Quartz.CGEventMaskBit(Quartz.kCGEventRightMouseDragged)
         )
 
         self._tap = Quartz.CGEventTapCreate(
@@ -166,7 +209,7 @@ class ModifierClickHold:
         )
 
         print(
-            "Ready. Hold Control+Shift = left click held. "
+            "Ready. Control+Shift = left hold, Option+Shift = right hold. "
             "Release keys = release click. Ctrl+C to quit.",
             flush=True,
         )
@@ -179,7 +222,10 @@ def main() -> int:
         return 1
 
     argparse.ArgumentParser(
-        description="Hold Control+Shift to virtually press the left mouse button."
+        description=(
+            "Hold Control+Shift / Option+Shift to virtually press "
+            "the left / right mouse button."
+        )
     ).parse_args()
 
     try:
