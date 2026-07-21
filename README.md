@@ -1,17 +1,19 @@
 # virtual-drag
 
-Hold a modifier chord to virtually press and hold a mouse button on macOS.
+Hold a modifier chord, then move the mouse, to virtually press and hold a mouse button on macOS.
 
 | Chord | Action |
 | --- | --- |
-| **Control+Shift** | Left-button down (left drag) |
-| **Option+Shift** | Right-button down (right drag) |
+| **Control+Shift** + move | Left-button drag |
+| **Option+Shift** + move | Right-button drag |
+
+The chord alone does nothing until the mouse moves, so IDE shortcuts like Option+Shift+Arrow are not treated as a click.
 
 Useful when a physical button is unreliable for dragging:
 
 1. Move the cursor into place
-2. Hold the chord → virtual button down
-3. Move the mouse → drag
+2. Hold the chord
+3. Move the mouse → virtual button down + drag
 4. Release the keys → virtual button up
 
 Injected clicks have modifiers stripped, so Control+Shift does **not** become a Control-click (right-click).
@@ -51,12 +53,12 @@ Quit with **Ctrl+C**.
 
 ## How it works
 
-While a chord is held, the script:
+Holding a bare chord only *arms* a drag. On the first mouse move:
 
 - Posts a synthetic mouse-down for that button (with no modifier flags)
-- Rewrites mouse-move events into the matching drag events so apps track the drag
+- Rewrites that move (and later moves) into drag events
 - Posts mouse-up when the keys are released
 
-Chords only fire when held **alone** (no other keys, and no Command/fn). Other shortcuts win — e.g. Control+Shift+Tab or Option+Shift+Arrow release/skip the virtual click so the real shortcut can run.
+If you press another key before moving (e.g. Option+Shift+Arrow), the arm is cancelled and the real shortcut runs. Extra modifiers (Command/fn) also block activation.
 
 This requires a CGEvent tap, which is why Accessibility permission is needed.

@@ -1,17 +1,20 @@
 #!/usr/bin/env python3
 """
-Hold modifier chords alone to make macOS think a mouse button is pressed.
+Hold modifier chords alone, then move the mouse, to virtually press a button.
 
-  Control+Shift  → virtual left-button down (drag with left)
-  Option+Shift   → virtual right-button down (drag with right)
+  Control+Shift + move  → virtual left-button drag
+  Option+Shift  + move  → virtual right-button drag
+
+The chord alone does nothing until the mouse moves, so IDE shortcuts like
+Option+Shift+Arrow are not treated as a right-click.
 
 Only the bare chord counts. Any other key (or Command/fn) means that shortcut
 wins and the virtual click is released / not started.
 
 Use this when a physical button is unreliable for dragging:
   1. Move the cursor into place
-  2. Hold the chord     → virtual button down
-  3. Move the mouse     → drag
+  2. Hold the chord
+  3. Move the mouse     → virtual button down + drag
   4. Release the keys   → virtual button up
 
 Injected clicks have modifiers stripped, so Control+Shift does NOT become
@@ -115,10 +118,11 @@ _BUTTON = {
 
 
 class ModifierClickHold:
-    """Virtual left/right click while Control+Shift / Option+Shift are held alone."""
+    """Arm on chord; press button only once the mouse moves (drag intent)."""
 
     def __init__(self) -> None:
         self._held: str | None = None
+        self._armed: str | None = None
         self._tap = None
         # Non-modifier keys currently down — any of these means yield to other shortcuts.
         self._extra_keys: set[int] = set()
@@ -139,19 +143,39 @@ class ModifierClickHold:
         Quartz.CGEventSetIntegerValueField(event, USER_DATA_FIELD, OUR_TAG)
         Quartz.CGEventPost(Quartz.kCGHIDEventTap, event)
 
-    def _set_held(self, which: str | None) -> None:
-        if which == self._held:
+    def _release(self) -> None:
+        if self._held is not None:
+            self._post_button(self._held, False)
+            print(f"{self._held} click UP", flush=True)
+            self._held = None
+        self._armed = None
+
+    def _sync_chord(self, which: str | None) -> None:
+        """Update arm/hold from the current modifier chord (or None)."""
+        if which is None:
+            self._release()
+            return
+        if self._held == which:
             return
         if self._held is not None:
             self._post_button(self._held, False)
             print(f"{self._held} click UP", flush=True)
+            self._held = None
+        # Arm only — mouse-down waits for movement so Option+Shift+Arrow etc. stay clean.
+        self._armed = which
+
+    def _begin_drag(self, which: str, event) -> object:
+        self._armed = None
         self._held = which
-        if which is not None:
-            self._post_button(which, True)
-            print(f"{which} click DOWN (drag now)", flush=True)
+        self._post_button(which, True)
+        print(f"{which} click DOWN (drag now)", flush=True)
+        _button, _down, _up, drag_type = _BUTTON[which]
+        Quartz.CGEventSetType(event, drag_type)
+        Quartz.CGEventSetFlags(event, 0)
+        return event
 
     def _desired_hold(self, flags: int) -> str | None:
-        # Another key is down (e.g. Ctrl+Shift+Tab) — let that shortcut win.
+        # Another key is down (e.g. Option+Shift+Arrow) — let that shortcut win.
         if self._extra_keys:
             return None
         masked = flags & _MODS
@@ -193,12 +217,14 @@ class ModifierClickHold:
             if Quartz.CGEventGetIntegerValueField(event, USER_DATA_FIELD) == OUR_TAG:
                 return event
 
-        # While virtually held, turn plain moves into button-drags so apps track it.
-        if self._held is not None and event_type == Quartz.kCGEventMouseMoved:
-            _button, _down, _up, drag_type = _BUTTON[self._held]
-            Quartz.CGEventSetType(event, drag_type)
-            Quartz.CGEventSetFlags(event, 0)
-            return event
+        if event_type == Quartz.kCGEventMouseMoved:
+            if self._held is not None:
+                _button, _down, _up, drag_type = _BUTTON[self._held]
+                Quartz.CGEventSetType(event, drag_type)
+                Quartz.CGEventSetFlags(event, 0)
+                return event
+            if self._armed is not None:
+                return self._begin_drag(self._armed, event)
 
         if event_type in (
             Quartz.kCGEventFlagsChanged,
@@ -208,7 +234,7 @@ class ModifierClickHold:
             if event_type in (Quartz.kCGEventKeyDown, Quartz.kCGEventKeyUp):
                 self._track_key(event_type, event)
             flags = Quartz.CGEventGetFlags(event)
-            self._set_held(self._desired_hold(flags))
+            self._sync_chord(self._desired_hold(flags))
 
         return event
 
@@ -248,9 +274,8 @@ class ModifierClickHold:
         )
 
         print(
-            "Ready. Control+Shift = left hold, Option+Shift = right hold "
-            "(alone — other shortcuts take priority). "
-            "Release keys = release click. Ctrl+C to quit.",
+            "Ready. Control+Shift + move = left drag, Option+Shift + move = right drag. "
+            "Chord alone does nothing (IDE shortcuts OK). Ctrl+C to quit.",
             flush=True,
         )
         Quartz.CFRunLoopRun()
