@@ -1,87 +1,103 @@
 #!/usr/bin/env python3
 """
-Fix flaky left-click / drag by debouncing the physical mouse button.
+Hold Control+Shift to make macOS think left-click is pressed.
 
-Worn switches often open for a few milliseconds while dragging. The OS sees that
-as a release and drops the drag. This script intercepts left-button events and
-ignores brief "up" blips so macOS keeps thinking you're still holding.
+Use this when the physical left button is unreliable for dragging:
+  1. Move the cursor into place
+  2. Hold Control+Shift  → virtual left-button down
+  3. Move the mouse      → drag
+  4. Release the keys    → virtual left-button up
+
+Injected clicks have modifiers stripped, so Control+Shift does NOT become
+a Control-click (right-click) on macOS.
 
 Setup (once):
   System Settings → Privacy & Security → Accessibility
-  → enable your Terminal app (Terminal, iTerm, Cursor, etc.)
+  → enable your Terminal / Cursor / iTerm
 
 Run:
-  .venv/bin/python mouse_debounce.py
-  .venv/bin/python mouse_debounce.py --debounce-ms 120
-  .venv/bin/python mouse_debounce.py --click-lock
+  python3 main.py
 """
 
 from __future__ import annotations
 
 import argparse
+import os
 import sys
-import threading
-import time
+from pathlib import Path
 
-try:
-    import Quartz
-except ImportError:
+
+def _ensure_quartz() -> None:
+    """Re-exec with project .venv if this interpreter lacks Quartz."""
+    try:
+        import Quartz  # noqa: F401
+
+        return
+    except ImportError:
+        pass
+
+    root = Path(__file__).resolve().parent
+    venv_python = root / ".venv" / "bin" / "python"
+    if venv_python.exists() and Path(sys.executable).resolve() != venv_python.resolve():
+        os.execv(
+            str(venv_python),
+            [str(venv_python), str(Path(__file__).resolve()), *sys.argv[1:]],
+        )
+
     print(
         "Missing Quartz bindings. From this folder run:\n"
-        "  python3 -m venv .venv && .venv/bin/pip install pyobjc-framework-Quartz",
+        "  /opt/homebrew/bin/python3.13 -m venv .venv\n"
+        "  .venv/bin/pip install -r requirements.txt\n"
+        "  .venv/bin/python main.py",
         file=sys.stderr,
     )
     raise SystemExit(1)
 
 
-OUR_TAG = 0x4D4F5553  # 'MOUS' — marks events we inject so we don't re-process them
+_ensure_quartz()
+import Quartz  # noqa: E402
+
+
+OUR_TAG = 0x4D4F5553  # 'MOUS'
 USER_DATA_FIELD = Quartz.kCGEventSourceUserData
+CHORD = Quartz.kCGEventFlagMaskControl | Quartz.kCGEventFlagMaskShift
 
 
-class LeftClickDebouncer:
-    def __init__(self, debounce_ms: int, click_lock: bool, lock_ms: int) -> None:
-        self.debounce_s = max(debounce_ms, 1) / 1000.0
-        self.click_lock = click_lock
-        self.lock_s = max(lock_ms, 1) / 1000.0
+class ModifierClickHold:
+    """Virtual left-click while Control+Shift are held."""
 
-        self._lock = threading.Lock()
-        self._logical_down = False
-        self._pending_up: threading.Timer | None = None
-        self._down_at: float | None = None
-        self._locked = False
+    def __init__(self) -> None:
+        self._held = False
         self._tap = None
-        self._last_location = Quartz.CGPointMake(0, 0)
 
-    def _cancel_pending_up(self) -> None:
-        if self._pending_up is not None:
-            self._pending_up.cancel()
-            self._pending_up = None
+    def _cursor(self):
+        # CGEventSourceCreate + CGEventGetLocation needs an event; use current position.
+        event = Quartz.CGEventCreate(None)
+        loc = Quartz.CGEventGetLocation(event)
+        return loc
 
-    def _is_ours(self, event) -> bool:
-        return Quartz.CGEventGetIntegerValueField(event, USER_DATA_FIELD) == OUR_TAG
-
-    def _post(self, down: bool, location) -> None:
+    def _post_button(self, down: bool) -> None:
         source = Quartz.CGEventSourceCreate(Quartz.kCGEventSourceStateHIDSystemState)
         etype = (
             Quartz.kCGEventLeftMouseDown if down else Quartz.kCGEventLeftMouseUp
         )
         event = Quartz.CGEventCreateMouseEvent(
-            source, etype, location, Quartz.kCGMouseButtonLeft
+            source, etype, self._cursor(), Quartz.kCGMouseButtonLeft
         )
+        # Critical: no Control/Shift flags, or macOS treats it as Control-click.
+        Quartz.CGEventSetFlags(event, 0)
         Quartz.CGEventSetIntegerValueField(event, USER_DATA_FIELD, OUR_TAG)
         Quartz.CGEventPost(Quartz.kCGHIDEventTap, event)
 
-    def _commit_up(self) -> None:
-        with self._lock:
-            self._pending_up = None
-            if not self._logical_down:
-                return
-            self._logical_down = False
-            self._locked = False
-            self._down_at = None
-            location = self._last_location
-        self._post(False, location)
-        print("release", flush=True)
+    def _set_held(self, held: bool) -> None:
+        if held == self._held:
+            return
+        self._held = held
+        self._post_button(held)
+        print("click DOWN (drag now)" if held else "click UP", flush=True)
+
+    def _chord_active(self, flags: int) -> bool:
+        return (flags & CHORD) == CHORD
 
     def _on_event(self, proxy, event_type, event, refcon):
         if event_type in (
@@ -92,72 +108,40 @@ class LeftClickDebouncer:
                 Quartz.CGEventTapEnable(self._tap, True)
             return event
 
-        if event_type not in (
+        # Ignore our own injected mouse events.
+        if event_type in (
             Quartz.kCGEventLeftMouseDown,
             Quartz.kCGEventLeftMouseUp,
+            Quartz.kCGEventLeftMouseDragged,
         ):
-            return event
-
-        if self._is_ours(event):
-            return event
-
-        location = Quartz.CGEventGetLocation(event)
-        now = time.monotonic()
-        pressed = event_type == Quartz.kCGEventLeftMouseDown
-
-        with self._lock:
-            self._last_location = location
-
-            if pressed:
-                self._cancel_pending_up()
-
-                if self._locked:
-                    # Second click while locked → unlock.
-                    self._locked = False
-                    self._logical_down = False
-                    self._down_at = None
-                    threading.Thread(
-                        target=self._post, args=(False, location), daemon=True
-                    ).start()
-                    print("click-lock off", flush=True)
-                    return None
-
-                if not self._logical_down:
-                    self._logical_down = True
-                    self._down_at = now
-                    print("press", flush=True)
-                    return event  # let real down through
-
-                # Extra bounce-down while held: swallow.
-                return None
-
-            # Physical up
-            if not self._logical_down:
+            if Quartz.CGEventGetIntegerValueField(event, USER_DATA_FIELD) == OUR_TAG:
                 return event
 
-            if self.click_lock and self._down_at is not None:
-                if (now - self._down_at) >= self.lock_s and not self._locked:
-                    self._locked = True
-                    self._cancel_pending_up()
-                    print("click-lock on (move, then click to release)", flush=True)
-                    return None
+        # While virtually held, turn plain moves into left-drags so apps track it.
+        if self._held and event_type == Quartz.kCGEventMouseMoved:
+            Quartz.CGEventSetType(event, Quartz.kCGEventLeftMouseDragged)
+            Quartz.CGEventSetFlags(event, 0)
+            return event
 
-            if self._locked:
-                return None
+        if event_type in (
+            Quartz.kCGEventFlagsChanged,
+            Quartz.kCGEventKeyDown,
+            Quartz.kCGEventKeyUp,
+        ):
+            flags = Quartz.CGEventGetFlags(event)
+            self._set_held(self._chord_active(flags))
 
-            # Swallow this up; only release if it stays up past the debounce window.
-            # If the switch bounces back down in time, _cancel_pending_up keeps the hold.
-            self._cancel_pending_up()
-            t = threading.Timer(self.debounce_s, self._commit_up)
-            t.daemon = True
-            self._pending_up = t
-            t.start()
-            return None
+        return event
 
     def run(self) -> None:
         mask = (
-            Quartz.CGEventMaskBit(Quartz.kCGEventLeftMouseDown)
+            Quartz.CGEventMaskBit(Quartz.kCGEventFlagsChanged)
+            | Quartz.CGEventMaskBit(Quartz.kCGEventKeyDown)
+            | Quartz.CGEventMaskBit(Quartz.kCGEventKeyUp)
+            | Quartz.CGEventMaskBit(Quartz.kCGEventMouseMoved)
+            | Quartz.CGEventMaskBit(Quartz.kCGEventLeftMouseDown)
             | Quartz.CGEventMaskBit(Quartz.kCGEventLeftMouseUp)
+            | Quartz.CGEventMaskBit(Quartz.kCGEventLeftMouseDragged)
         )
 
         self._tap = Quartz.CGEventTapCreate(
@@ -182,36 +166,11 @@ class LeftClickDebouncer:
         )
 
         print(
-            f"Debouncing left click ({int(self.debounce_s * 1000)} ms). "
-            f"Ctrl+C to stop."
-            + (" Click-lock enabled." if self.click_lock else ""),
+            "Ready. Hold Control+Shift = left click held. "
+            "Release keys = release click. Ctrl+C to quit.",
             flush=True,
         )
         Quartz.CFRunLoopRun()
-
-
-def parse_args() -> argparse.Namespace:
-    p = argparse.ArgumentParser(
-        description="Debounce left mouse button so drags don't drop on a worn switch."
-    )
-    p.add_argument(
-        "--debounce-ms",
-        type=int,
-        default=80,
-        help="Ignore button-up blips shorter than this (default: 80). Try 50–150.",
-    )
-    p.add_argument(
-        "--click-lock",
-        action="store_true",
-        help="Hold briefly to lock the press; click again to release.",
-    )
-    p.add_argument(
-        "--lock-ms",
-        type=int,
-        default=400,
-        help="Hold duration to engage click-lock (default: 400).",
-    )
-    return p.parse_args()
 
 
 def main() -> int:
@@ -219,13 +178,12 @@ def main() -> int:
         print("This script is for macOS only.", file=sys.stderr)
         return 1
 
-    args = parse_args()
+    argparse.ArgumentParser(
+        description="Hold Control+Shift to virtually press the left mouse button."
+    ).parse_args()
+
     try:
-        LeftClickDebouncer(
-            debounce_ms=args.debounce_ms,
-            click_lock=args.click_lock,
-            lock_ms=args.lock_ms,
-        ).run()
+        ModifierClickHold().run()
     except KeyboardInterrupt:
         print("\nStopped.", flush=True)
         return 0
